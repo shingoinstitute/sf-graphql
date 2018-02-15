@@ -1,0 +1,31 @@
+{
+  "name": "@shingo/graphql-salesforce",
+  "version": "1.0.0",
+  "description": "Provides a GraphQL wrapper over the Salesforce SOQL API",
+  "main": "dist/index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shingoinstitute/graphql-salesforce.git"
+  },
+  "keywords": [
+    "graphql",
+    "salesforce"
+  ],
+  "author": "Abraham White",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/shingoinstitute/graphql-salesforce/issues"
+  },
+  "homepage": "https://github.com/shingoinstitute/graphql-salesforce#readme",
+  "dependencies": {
+    "graphql": "^0.13.0",
+    "graphql-tools": "^2.21.0",
+    "jsforce": "^1.8.0"
+  },
+  "devDependencies": {
+    "@types/jsforce": "^1.8.7"
+  }
+}
