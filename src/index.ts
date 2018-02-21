@@ -18,6 +18,3 @@ if (process.env.SF_USER
         // tslint:disable-next-line:no-console
         console.log('ERROR, env vars not specified');
     }
-
-// const test = new ErrorTest();
-// console.log(test.connect());
