@@ -1,26 +1,10 @@
-import {
-    GraphQLObjectType,
-    GraphQLInt,
-    GraphQLFloat,
-    GraphQLString,
-    GraphQLBoolean,
-    GraphQLID,
-    GraphQLList,
-    GraphQLNonNull,
-    GraphQLScalarType,
-    GraphQLSchema,
-    GraphQLUnionType,
- } from 'graphql';
 import { Connection, ConnectionOptions, SObjectField, SObjectMetadata } from 'jsforce';
 import { Nothing, Just, Maybe, map, isJust, justs } from 'sanctuary';
-import * as fs from 'fs';
-
-interface ScalarType {
-    [name: string]: {
-        type: GraphQLObjectType;
-        description: string;
-    };
-}
+import { GraphQLString, GraphQLFloat, GraphQLNonNull,
+    GraphQLID, GraphQLList, GraphQLBoolean, GraphQLInt, GraphQLScalarType,
+    GraphQLUnionType,
+    GraphQLObjectType,
+    GraphQLSchema} from 'graphql';
 
 interface Maybe<A> {
     constructor: {
@@ -28,120 +12,204 @@ interface Maybe<A> {
     };
 }
 
+interface ScalarType {
+    [name: string]: {
+        type: GraphQLScalarType | string[];
+        description: string;
+    };
+}
+
+interface ObjectType {
+    name: string;
+    description: string;
+    fields: ScalarType;
+}
+
+const addressType = new GraphQLObjectType({
+    name: 'Address',
+    fields: () => ({
+        Accuracy: {
+            type: GraphQLString,
+            description: 'Accuracy level of the geocode for the address',
+        },
+        City: {
+            type: GraphQLString,
+            description: 'The city detail for the address',
+        },
+        Country: {
+            type: GraphQLString,
+            description: 'The country detail for the address',
+        },
+    }),
+});
+
+const locationType = new GraphQLObjectType({
+    name: 'Location',
+    fields: () => ({
+        latitude: {
+            type: GraphQLString,
+        },
+        longitude: {
+            type: GraphQLString,
+        },
+    }),
+});
+
 export class SFGraphQL {
-    private connection?: Connection;
-    private objectTypes: {[name: string]: GraphQLObjectType | GraphQLUnionType} = {};
-    private addressType = new GraphQLObjectType({
-        name: 'Address',
-        fields: () => ({
-            Accuracy: {
-                type: GraphQLString,
-                description: 'Accuracy level of the geocode for the address',
-            },
-            City: {
-                type: GraphQLString,
-                description: 'The city detail for the address',
-            },
-            Country: {
-                type: GraphQLString,
-                description: 'The country detail for the address',
-            },
-        }),
-    });
+    private options: ConnectionOptions | {};
 
-    private locationType = new GraphQLObjectType({
-        name: 'Location',
-        fields: () => ({
-            latitude: {
-                type: GraphQLString,
-            },
-            longitude: {
-                type: GraphQLString,
-            },
-        }),
-    });
+    constructor(private username: string, private password: string, opts?: Partial<ConnectionOptions>) {
+        this.options = opts || {};
+    }
 
-    constructor(private username: string, private password: string) { }
-
-    public connect(opts?: Partial<ConnectionOptions>) {
-        const conn = new Connection(opts || {});
-        this.connection = conn;
-        return this.makeSchema();
+    public buildSchema(opts?: Partial<ConnectionOptions>) {
+        if (opts) {
+            this.options = opts || {};
+        }
+        const conn = new Connection(this.options);
+        return this.makeSchema(conn);
     }
 
     /**
      * Makes a GraphQL schema from the Salesforce instance
      */
-    private async makeSchema() {
-        await this.connection!.login(this.username, this.password);
+    private async makeSchema(conn: Connection) {
+        await conn.login(this.username, this.password);
+        const global = await conn.describeGlobal();
+        const promises = global.sobjects
+                            .map(o => conn.sobject(o.name).describe())
+                            .map(o => this.makeObject(o));
 
-        const sponsor: SObjectMetadata = JSON.parse(fs.readFileSync('./sponsors.json', { encoding: 'utf8'}));
-        const event: SObjectMetadata = JSON.parse(fs.readFileSync('./events.json', { encoding: 'utf8'}));
-
-        const global = await this.connection!.describeGlobal();
-        const promises =
-        // tslint:disable-next-line:comment-format
-        /*
-        [Promise.resolve(sponsor), Promise.resolve(event)]
-        /*/
-                        global.sobjects
-                            .map(o => this.connection!.sobject(o.name).describe())
-        // tslint:disable-next-line:comment-format
-        //*/
-                            // remember, we have to use the arrow function because 'this'
-                            // doesn't get bound properly in makeObjectType otherwise
-                            .map(o => this.makeObjectType(o));
-        const fields = (justs(await Promise.all(promises)) as GraphQLObjectType[])
-                            // maps into the format that graphql expects for a field
-                            .map(o => ({ [o.name]: { type: o, description: o.description } }))
-                            // combine all the objects into one
+        const objects = justs<ObjectType>(await Promise.all(promises));
+        const fields = this.resolveReferences(objects)
+                            .map(o => ({
+                                [o.name]: {
+                                    type: o,
+                                    description: o.description,
+                            }}))
                             .reduce((p, c) => ({...p, ...c}), {});
 
         return new GraphQLSchema({
             query: new GraphQLObjectType({
-                name: 'Salesforce',
+                name: 'Query',
+                description: 'Salesforce',
                 fields: () => fields,
             }),
         });
     }
 
     /**
-     * Gets the GraphQL type of a Salesforce reference - resolves the type of the referenced records
-     * @param field A Salesforce record field
+     * Makes an intermediate ObjectType object from an SObject
+     * @param object promies for the Salesforce object
      */
-    private async getReferenceType(field: SObjectField): Promise<Maybe<GraphQLObjectType>> {
-        if (field.referenceTo && field.referenceTo.length) {
-            // if a single reference, it can refer to just one type
-            if (field.referenceTo.length === 1
-                && field.referenceTo[0] !== null
-                && typeof field.referenceTo[0] !== 'undefined') {
-                return this.getObjectType(field.referenceTo[0]!);
-            }
-            // if multiple reference types, create a union
-            const referencesP = field.referenceTo
-                                .filter(Boolean)
-                                .map(f => this.getObjectType(f as string));
-            const refs = justs(await Promise.all(referencesP)) as GraphQLObjectType[];
-            const newType = new GraphQLUnionType({
-                // build the name from the names of the sub types
-                name: refs.map(r => r.name).reduce((p, c) =>
-                    // make sure the name is in camel case
-                    c.substr(0, 1).toUpperCase() + c.substring(1)
-                    + p.substr(0, 1).toUpperCase() + p.substring(1)
-                    , 'Union'),
-                    types: refs,
-            });
-            this.objectTypes[newType.name] = newType;
-            return Just(newType);
+    private async makeObject(object: Promise<SObjectMetadata>): Promise<Maybe<ObjectType>> {
+        const metadata = await object;
+        if (!metadata.fields || metadata.fields.length === 0) {
+            return Nothing;
         }
-        return Nothing;
+
+        const fieldsA = justs<ScalarType>(metadata.fields
+                                            .filter(Boolean)
+                                            .map(f => this.makeField(f)));
+
+        if (fieldsA.length === 0) {
+            return Nothing;
+        }
+
+        // Flatten the array into a single object
+        const fields = fieldsA.reduce((p, c) => ({...p, ...c}), {});
+
+        return Just<ObjectType>({
+            name: metadata.name,
+            description: metadata.label,
+            fields,
+        });
+    }
+
+    /**
+     * Makes a GraphQL field from a SObject Field
+     * @param field the salesforce object field
+     */
+    private makeField(field: SObjectField) {
+        const type = this.getFieldType(field);
+        return map<GraphQLScalarType | string[], ScalarType>(t => ({
+            [field.name]: {
+                type: t,
+                description: field.label,
+            },
+        }))(type) as Maybe<ScalarType>;
+    }
+
+    /**
+     * Resolves inter-object references and converts to GraphQLObjects
+     * @param objects list of ObjectTypes
+     */
+    private resolveReferences(objects: ObjectType[]) {
+        const newObjects: {[name: string]: GraphQLObjectType} = {};
+        const unions: {[name: string]: GraphQLUnionType} = {};
+        // go through each object's fields
+        // when reference is encountered (a string[] instead of GraphQLScalar)
+        // create a function that references newObjects[name]
+
+        interface Input {
+            type: GraphQLScalarType | string[];
+            description: string;
+        }
+
+        interface Output {
+            type: GraphQLScalarType | GraphQLUnionType | GraphQLObjectType;
+            description: string;
+        }
+
+        const newObjList = objects.map(obj => {
+            const newFields = (fields: ScalarType) => map<Input, Output>(i => {
+                if (Array.isArray(i.type)) {
+                    if (i.type.length === 1) {
+                        return {
+                            ...i,
+                            type: newObjects[i.type[0]],
+                        };
+                    }
+
+                    const name = i.type.reduce((p, c) =>
+                            c.substr(0, 1).toUpperCase() + c.substring(1)
+                            + p.substr(0, 1).toUpperCase() + p.substring(1), 'Union');
+                    const types = i.type.map(t => newObjects[t]);
+
+                    const union = unions[name] || new GraphQLUnionType({
+                        name,
+                        types,
+                    });
+
+                    if (!(name in Object.keys(unions))) {
+                        unions[name] = union;
+                    }
+
+                    return {
+                        ...i,
+                        type: union,
+                    };
+                } else {
+                    return i as Output;
+                }
+            })(fields);
+
+            return new GraphQLObjectType({
+                ...obj,
+                fields: () => newFields(obj.fields),
+            });
+        });
+
+        newObjList.forEach(o => newObjects[o.name] = o);
+
+        return newObjList;
     }
 
     /**
      * Converts between Salesforce and GraphQL types
      * @param field A Salesforce record field
      */
-    private getFieldType(field: SObjectField): Promise<Maybe<GraphQLScalarType | GraphQLObjectType>> {
+    private getFieldType(field: SObjectField): Maybe<GraphQLScalarType | string[]> {
         /* Salesforce scalar types:
         calculated: string
         combobox: string
@@ -167,90 +235,31 @@ export class SFGraphQL {
         int => Int
         time => String
         */
-
         switch (field.type) {
-            case 'calculated':      return Promise.resolve(Just(GraphQLString));
-            case 'combobox':        return Promise.resolve(Just(GraphQLString));
-            case 'currency':        return Promise.resolve(Just(GraphQLFloat));
-            case 'email':           return Promise.resolve(Just(GraphQLString));
-            case 'encryptedstring': return Promise.resolve(Just(GraphQLString));
-            case 'id':              return Promise.resolve(Just(new GraphQLNonNull(GraphQLID)));
-            case 'multipicklist':   return Promise.resolve(Just(new GraphQLList(GraphQLString)));
-            case 'percent':         return Promise.resolve(Just(GraphQLFloat));
-            case 'phone':           return Promise.resolve(Just(GraphQLString));
-            case 'textarea':        return Promise.resolve(Just(GraphQLString));
-            case 'url':             return Promise.resolve(Just(GraphQLString));
-            case 'base64':          return Promise.resolve(Just(GraphQLString));
-            case 'boolean':         return Promise.resolve(Just(GraphQLBoolean));
-            case 'byte':            return Promise.resolve(Just(GraphQLString));
-            case 'date':            return Promise.resolve(Just(GraphQLString));
-            case 'datetime':        return Promise.resolve(Just(GraphQLString));
-            case 'double':          return Promise.resolve(Just(GraphQLFloat));
-            case 'int':             return Promise.resolve(Just(GraphQLInt));
-            case 'time':            return Promise.resolve(Just(GraphQLString));
-            // this recursive call is causing issues - Salesforce may be closing the connection prematurely
-            // we get an ECONNRESET error
-            // However, this may be the most important part of the conversion - otherwise we don't get a graph
-            // TODO: Figure out how to resolve this
-            // case 'reference':       return this.getReferenceType(field);
-            case 'address':         return Promise.resolve(Just(this.addressType));
-            case 'location':        return Promise.resolve(Just(this.locationType));
-            default:                return Promise.resolve(Just(GraphQLString));
-        }
-    }
-
-    /**
-     * Makes a GraphQL scalar type
-     * @param field Salesforce record Field returned by describe call
-     */
-    private async makeScalarType(field: SObjectField): Promise<Maybe<ScalarType>> {
-        const type = await this.getFieldType(field);
-        return map((t: GraphQLObjectType) => ({
-            [field.name]: {
-                type: t,
-                description: field.label,
-            },
-        }))(type) as any; // we really need some HKT in typescript
-    }
-
-    /**
-     * Creates a GraphQL type for a record
-     * @param object Promise for record metadata returned by the Salesforce describe
-     */
-    private async makeObjectType(object: Promise<SObjectMetadata>): Promise<Maybe<GraphQLObjectType>> {
-        const metadata = await object;
-        if (!metadata.fields) {
-            return Nothing;
-        }
-
-        const fieldsP = metadata.fields.filter(Boolean).map(f => this.makeScalarType(f));
-        // discard the Nothing fields
-        const objFields = (justs(await Promise.all(fieldsP)) as ScalarType[]);
-        // if (objFields.length === 0) return Nothing;
-        // combine the individual scalar field objects
-        const fields = objFields.reduce((p, c) => ({...p, ...c}), {});
-
-        const type: GraphQLObjectType = new GraphQLObjectType({
-            name: metadata.name,
-            description: metadata.label,
-            fields: () => fields,
-        });
-
-        // this is just a form of memoization, not really an impure function
-        this.objectTypes[metadata.name] = type;
-        return Just(type);
-    }
-
-    /**
-     * Gets the GraphQL type of a Salesforce record
-     * @param name Name of the object record
-     */
-    private getObjectType(name: string) {
-        if (name in this.objectTypes) {
-            // return the cached/memoized value if it exists
-            return Promise.resolve(Just(this.objectTypes[name]));
-        } else {
-            return this.makeObjectType(this.connection!.sobject(name).describe());
+            case 'calculated':      return (Just(GraphQLString));
+            case 'combobox':        return (Just(GraphQLString));
+            case 'currency':        return (Just(GraphQLFloat));
+            case 'email':           return (Just(GraphQLString));
+            case 'encryptedstring': return (Just(GraphQLString));
+            case 'id':              return (Just(new GraphQLNonNull(GraphQLID)));
+            case 'multipicklist':   return (Just(new GraphQLList(GraphQLString)));
+            case 'percent':         return (Just(GraphQLFloat));
+            case 'phone':           return (Just(GraphQLString));
+            case 'textarea':        return (Just(GraphQLString));
+            case 'url':             return (Just(GraphQLString));
+            case 'base64':          return (Just(GraphQLString));
+            case 'boolean':         return (Just(GraphQLBoolean));
+            case 'byte':            return (Just(GraphQLString));
+            case 'date':            return (Just(GraphQLString));
+            case 'datetime':        return (Just(GraphQLString));
+            case 'double':          return (Just(GraphQLFloat));
+            case 'int':             return (Just(GraphQLInt));
+            case 'time':            return (Just(GraphQLString));
+            case 'reference':       return field.referenceTo && field.referenceTo.length
+                                            ? Just(field.referenceTo) : Nothing;
+            case 'address':         return (Just(addressType));
+            case 'location':        return (Just(locationType));
+            default:                return (Just(GraphQLString));
         }
     }
 }
