@@ -1,10 +1,10 @@
-import { Connection, ConnectionOptions, SObjectField, SObjectMetadata } from 'jsforce';
+import { Connection, ConnectionOptions, SObjectField, SObjectMetadata, SObjectRelationship } from 'jsforce';
 import { Nothing, Just, Maybe, map, isJust, justs } from 'sanctuary';
 import { GraphQLString, GraphQLFloat, GraphQLNonNull,
     GraphQLID, GraphQLList, GraphQLBoolean, GraphQLInt, GraphQLScalarType,
-    GraphQLUnionType,
-    GraphQLObjectType,
-    GraphQLSchema} from 'graphql';
+    GraphQLUnionType, GraphQLObjectType,
+    GraphQLSchema, GraphQLFieldConfig, GraphQLResolveInfo, isLeafType} from 'graphql';
+import { filter, pick } from 'ramda';
 
 interface Maybe<A> {
     constructor: {
@@ -55,8 +55,11 @@ const locationType = new GraphQLObjectType({
     }),
 });
 
+
+
 export class SFGraphQL {
     private options: ConnectionOptions | {};
+    private objects: ObjectType[] = [];
 
     constructor(private username: string, private password: string, opts?: Partial<ConnectionOptions>) {
         this.options = opts || {};
@@ -81,11 +84,36 @@ export class SFGraphQL {
                             .map(o => this.makeObject(o));
 
         const objects = justs<ObjectType>(await Promise.all(promises));
+        this.objects = objects;
         const fields = this.resolveReferences(objects)
                             .map(o => ({
                                 [o.name]: {
-                                    type: o,
+                                    type: new GraphQLList(o),
                                     description: o.description,
+                                    resolve: (root: any, args: any, context: any, info: GraphQLResolveInfo) => {
+                                        // resolver
+                                        const obj = this.objects.filter(o => o.name === info.fieldName);
+                                        if (obj.length) {
+                                            const leafs = filter(f => !Array.isArray(f.type) && isLeafType(f.type),
+                                                                obj[0].fields);
+                                            const node = info.fieldNodes.filter(n => n.name.value === info.fieldName);
+                                            if (!node.length) return;
+                                            const selections =
+                                                node[0].selectionSet && node[0].selectionSet!.selections
+                                                    .filter(s => s.kind === 'Field')
+                                                    .filter(s => typeof (s as any).selectionSet === 'undefined')
+                                                    .map(s => (s as any).name.value as string);
+                                            if (!selections) return;
+                                            const conn = new Connection(this.options);
+                                            return conn.login(this.username, this.password).then(() => {
+                                                // tslint:disable-next-line:max-line-length
+                                                return conn.query(`SELECT ${selections.join(', ')} FROM ${info.fieldName}`);
+                                            }).then(a => {
+                                                if (!a.records) return;
+                                                return (a.records.map(r => pick(selections, r)));
+                                            });
+                                        }
+                                    },
                             }}))
                             .reduce((p, c) => ({...p, ...c}), {});
 
@@ -104,25 +132,45 @@ export class SFGraphQL {
      */
     private async makeObject(object: Promise<SObjectMetadata>): Promise<Maybe<ObjectType>> {
         const metadata = await object;
-        if (!metadata.fields || metadata.fields.length === 0) {
+        if ((!metadata.fields || metadata.fields.length === 0)
+        && (!metadata.childRelationships || metadata.childRelationships.length === 0)) {
             return Nothing;
         }
 
-        const fieldsA = justs<ScalarType>(metadata.fields
+        const fieldsA = justs<ScalarType>((metadata.fields || [])
                                             .filter(Boolean)
                                             .map(f => this.makeField(f)));
 
-        if (fieldsA.length === 0) {
+
+        const relationsA = justs<ScalarType>((metadata.childRelationships || [])
+                                                .filter(Boolean)
+                                                .map(f => this.makeRelationship(f)));
+
+        if (!fieldsA.length && !relationsA.length) {
             return Nothing;
         }
-
         // Flatten the array into a single object
-        const fields = fieldsA.reduce((p, c) => ({...p, ...c}), {});
+        const fields = [...fieldsA, ...relationsA].reduce((p, c) => ({...p, ...c}), {});
 
         return Just<ObjectType>({
             name: metadata.name,
             description: metadata.label,
             fields,
+        });
+    }
+
+    private makeRelationship(rel: SObjectRelationship) {
+        const type = [rel.childSObject];
+        // if relationshipName is null, it is a child to parent
+        // how do we indicate this for queries?
+        return Just({
+            [rel.relationshipName || rel.childSObject]: {
+                type,
+                description: (!rel.relationshipName ? 'Parent' : 'Child')
+                    + ' relationship to ' + rel.childSObject,
+                childRelationship: true,
+                toParent: !rel.relationshipName,
+            },
         });
     }
 
@@ -255,8 +303,9 @@ export class SFGraphQL {
             case 'double':          return (Just(GraphQLFloat));
             case 'int':             return (Just(GraphQLInt));
             case 'time':            return (Just(GraphQLString));
-            case 'reference':       return field.referenceTo && field.referenceTo.length
-                                            ? Just(field.referenceTo) : Nothing;
+            case 'reference':       return Just(GraphQLID);
+            // case 'reference':       return field.referenceTo && field.referenceTo.length
+            //                                 ? Just(field.referenceTo) : Nothing;
             case 'address':         return (Just(addressType));
             case 'location':        return (Just(locationType));
             default:                return (Just(GraphQLString));
