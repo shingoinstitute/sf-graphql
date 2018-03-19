@@ -104,7 +104,7 @@ export class SFGraphQL {
     }
 
     private getTypeInfoForQuery(q: Query, root: GraphQLObjectType): Query
-        & { leaf: boolean, relationship: boolean, childRelationship: boolean } {
+        & { leaf: boolean, relationship: boolean, childRelationship: boolean, description: string } {
         const queryRoot = root.getFields()[q.root];
         const queryType = getNamedType(queryRoot.type);
         if (isLeafType(queryType)) {
@@ -113,15 +113,17 @@ export class SFGraphQL {
                 leaf: true,
                 relationship: false,
                 childRelationship: false,
+                description: queryType.description,
             };
         }
         if (isOutputType(queryType)) {
             return {
                 ...q,
-                relationship: !!(queryType as any).relationship,
-                childRelationship: !!(queryType as any).childRelationship,
+                relationship: !!(queryRoot as any).relationship,
+                childRelationship: !!(queryRoot as any).childRelationship,
                 leaf: false,
                 sub: q.sub.map(s => this.getTypeInfoForQuery(s, queryType as GraphQLObjectType)),
+                description: queryType.description,
             };
         }
 
@@ -130,6 +132,7 @@ export class SFGraphQL {
             leaf: false,
             relationship: false,
             childRelationship: false,
+            description: queryType.description,
         };
     }
 
