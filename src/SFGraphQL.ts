@@ -3,7 +3,8 @@ import { Nothing, Just, Maybe, map, isJust, justs, fromMaybe } from 'sanctuary';
 import { GraphQLString, GraphQLFloat, GraphQLNonNull,
     GraphQLID, GraphQLList, GraphQLBoolean, GraphQLInt, GraphQLScalarType,
     GraphQLUnionType, GraphQLObjectType, GraphQLSchema, GraphQLFieldConfig,
-    GraphQLResolveInfo, isLeafType, GraphQLType, GraphQLOutputType, FieldNode, getNamedType, isCompositeType, isOutputType} from 'graphql';
+    GraphQLResolveInfo, isLeafType, GraphQLType, GraphQLOutputType, FieldNode, getNamedType,
+    isCompositeType, isOutputType} from 'graphql';
 import { filter, pick } from 'ramda';
 import { writeFileSync } from 'fs';
 
@@ -64,6 +65,14 @@ interface Query {
     sub: Query[];
 }
 
+interface TypedQuery extends Query {
+    sub: TypedQuery[];
+    leaf: boolean;
+    relationship: boolean;
+    childRelationship: boolean;
+    description: string;
+}
+
 export class SFGraphQL {
     private options: ConnectionOptions | {};
     private objects: ObjectType[] = [];
@@ -103,8 +112,7 @@ export class SFGraphQL {
         };
     }
 
-    private getTypeInfoForQuery(q: Query, root: GraphQLObjectType): Query
-        & { leaf: boolean, relationship: boolean, childRelationship: boolean, description: string } {
+    private getTypeInfoForQuery(q: Query, root: GraphQLObjectType): TypedQuery {
         const queryRoot = root.getFields()[q.root];
         const queryType = getNamedType(queryRoot.type);
         if (isLeafType(queryType)) {
@@ -114,7 +122,7 @@ export class SFGraphQL {
                 relationship: false,
                 childRelationship: false,
                 description: queryType.description,
-            };
+            } as TypedQuery;
         }
         if (isOutputType(queryType)) {
             return {
@@ -133,13 +141,52 @@ export class SFGraphQL {
             relationship: false,
             childRelationship: false,
             description: queryType.description,
-        };
+        } as TypedQuery;
+    }
+
+    private isRootParentChild(q: TypedQuery) {
+        const parents = q.sub.filter(s => !s.childRelationship && s.relationship);
+        return parents.length && parents.some(p => p.childRelationship);
+    }
+
+    private isRootChildChild(q: TypedQuery) {
+        const children = q.sub.filter(s => s.childRelationship);
+        return children.length && children.some(p => p.childRelationship);
+    }
+
+    private isRootParentParent(q: TypedQuery) {
+        const parents = q.sub.filter(s => s.relationship && !s.childRelationship);
+        return parents.length && parents.some(p => p.relationship && !p.childRelationship);
+    }
+
+    private isRootChildParent(q: TypedQuery) {
+        const children = q.sub.filter(s => s.childRelationship);
+        return children.length && children.some(c => c.relationship && !c.childRelationship);
+    }
+
+    private buildSOQLQuery(q: TypedQuery): string | null {
+        const leafs = q.sub.filter(s => s.leaf);
+        const children = q.sub.filter(s => s.childRelationship);
+        const parents = q.sub.filter(s => !s.childRelationship && s.relationship);
+        let leafsString = '';
+        let childrenString = '';
+        let parentString = '';
+
+        if (leafs.length) {
+            leafsString = leafs.map(l => l.root).join(',');
+        }
+
+        if (children.length) {
+            childrenString = '(' + children.map(c => this.buildSOQLQuery(c)).join('),(') + ')';
+        }
+
+        return leafs.length ? `SELECT ${leafsString} FROM ${q.root}` : null;
     }
 
     private async makeSchema(conn: Connection) {
         await conn.login(this.username, this.password);
         const global = await conn.describeGlobal();
-        const describes = global.sobjects .map(o => conn.sobject(o.name).describe());
+        const describes = global.sobjects.map(o => conn.sobject(o.name).describe());
 
         // describes.forEach(o => this.writeSObject(o));
 
@@ -152,7 +199,7 @@ export class SFGraphQL {
                                 [o.name]: {
                                     type: new GraphQLList(o),
                                     description: o.description,
-                                    resolve: (root: any, args: any, context: any, info: GraphQLResolveInfo) => {
+                                    resolve: async (root: any, args: any, context: any, info: GraphQLResolveInfo) => {
                                         console.log('root', root);
                                         console.log('args', args);
                                         console.log('context', context);
@@ -162,6 +209,12 @@ export class SFGraphQL {
                                         const typed = queries.map(q => this.getTypeInfoForQuery(q,
                                                 info.parentType as GraphQLObjectType));
                                         console.log('typed', typed);
+                                        const query = this.buildSOQLQuery(typed[0]);
+                                        if (query) {
+                                            await conn.login(this.username, this.password);
+                                            return conn.query(query);
+                                        }
+                                        return [];
                                     },
                             }}))
                             .reduce((p, c) => ({...p, ...c}), {});
@@ -217,6 +270,7 @@ export class SFGraphQL {
                     description: 'Child relationship to ' + rel.childSObject,
                     relationship: true,
                     childRelationship: true,
+                    childObject: rel.childSObject,
                 },
             });
         }

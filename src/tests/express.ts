@@ -1,7 +1,6 @@
 import SFGraphQL from '../SFGraphQL';
 import express = require('express');
 import graphqlHTTP = require('express-graphql');
-import { writeFileSync } from 'fs';
 
 // Some test code
 if (process.env.SF_USER
@@ -15,9 +14,6 @@ if (process.env.SF_USER
         };
 
         sfg.buildSchema(options).then(s => {
-            writeFileSync('output2.json', JSON.stringify(s));
-            return s;
-        }).then(s => {
             const app = express();
             app.use('/graphql', graphqlHTTP({
                 schema: s,
