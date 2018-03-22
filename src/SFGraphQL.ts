@@ -5,8 +5,11 @@ import { GraphQLString, GraphQLFloat, GraphQLNonNull,
     GraphQLUnionType, GraphQLObjectType, GraphQLSchema, GraphQLFieldConfig,
     GraphQLResolveInfo, isLeafType, GraphQLType, GraphQLOutputType, FieldNode, getNamedType,
     isCompositeType, isOutputType, GraphQLFieldResolver} from 'graphql';
-import { filter, pick } from 'ramda';
+import { filter, pick, flatten } from 'ramda';
 import { writeFileSync } from 'fs';
+import { resolveParentQueries, resolveLeafs, Query,
+    TypedQuery, getTypedQuery, resolveChildrenQueries, leafsFullyResolved, resolve } from './SOQL';
+import { isNumber } from 'util';
 
 interface Maybe<A> {
     constructor: {
@@ -60,19 +63,6 @@ const locationType = new GraphQLObjectType({
 });
 
 
-interface Query {
-    root: string;
-    sub: Query[];
-}
-
-interface TypedQuery extends Query {
-    sub: TypedQuery[];
-    leaf: boolean;
-    relationship: boolean;
-    childRelationship: boolean;
-    description: string;
-}
-
 export class SFGraphQL {
     private options: ConnectionOptions | {};
     private objects: ObjectType[] = [];
@@ -97,132 +87,45 @@ export class SFGraphQL {
     /**
      * Makes a GraphQL schema from the Salesforce instance
      */
-    private resolveQuery(f: FieldNode): Query {
-        const rootObj = f.name.value;
-        let subObjs: Query[] = [];
-        if (f.selectionSet) {
-            subObjs = f.selectionSet.selections
-                .filter(s => s.kind === 'Field')
-                .map(f => this.resolveQuery(f as FieldNode));
-        }
-
-        return {
-            root: rootObj,
-            sub: subObjs,
-        };
-    }
-
-    private getTypeInfoForQuery(q: Query, root: GraphQLObjectType): TypedQuery {
-        const queryRoot = root.getFields()[q.root];
-        const queryType = getNamedType(queryRoot.type);
-        if (isLeafType(queryType)) {
-            return {
-                ...q,
-                leaf: true,
-                relationship: false,
-                childRelationship: false,
-                description: queryType.description,
-            } as TypedQuery;
-        }
-        if (isOutputType(queryType)) {
-            return {
-                ...q,
-                relationship: !!(queryRoot as any).relationship,
-                childRelationship: !!(queryRoot as any).childRelationship,
-                leaf: false,
-                sub: q.sub.map(s => this.getTypeInfoForQuery(s, queryType as GraphQLObjectType)),
-                description: queryType.description,
-            };
-        }
-
-        return {
-            ...q,
-            leaf: false,
-            relationship: false,
-            childRelationship: false,
-            description: queryType.description,
-        } as TypedQuery;
-    }
-
-    private isRootParentChild(q: TypedQuery) {
-        const parents = q.sub.filter(s => !s.childRelationship && s.relationship);
-        return parents.length > 0 && parents.some(p => p.childRelationship);
-    }
-
-    private isRootChildChild(q: TypedQuery) {
-        const children = q.sub.filter(s => s.childRelationship);
-        return children.length > 0 && children.some(p => p.childRelationship);
-    }
-
-    private isRootParentParent(q: TypedQuery): boolean {
-        const parents = q.sub.filter(s => s.relationship && !s.childRelationship);
-        return parents.length > 0 && parents.some(p => p.relationship && !p.childRelationship);
-    }
-
-    private isRootChildParent(q: TypedQuery) {
-        const children = q.sub.filter(s => s.childRelationship);
-        return children.length > 0 && children.some(c => c.relationship && !c.childRelationship);
-    }
 
     private createResolver(rel: boolean, childRel: boolean): GraphQLFieldResolver<any, any, any> {
-        if (rel && !childRel) {
-            // Parent relationship
-            return ( async (obj, args, context, info) => {
-                console.log('obj', obj);
-                console.log('args', args);
-                console.log('info', info);
+        return ( async (obj, args, context, info) => {
+            console.log('obj', obj);
+            console.log('info', info);
 
-                const queries =
-                    info.fieldNodes.map(f => this.getTypeInfoForQuery(this.resolveQuery(f),
-                                                                      info.parentType as GraphQLObjectType));
+            let leafs: string[] = [];
+            let parents: string[] = [];
+            let children: string[] = [];
+            let id = '';
 
-                console.log('queries', queries);
-                const leafs = queries[0].sub.filter(s => s.leaf).map(l => l.root);
+            const typed = getTypedQuery(info.fieldNodes, info.parentType as GraphQLObjectType);
+            console.log('typed', typed);
+            if (typeof obj !== 'undefined' && info.path && typeof info.path.prev !== 'undefined') {
+                // this is not a root resolver
+                return obj[info.path.key];
+            } else {
+                parents = resolveParentQueries(typed[0]);
+                children = resolveChildrenQueries(typed[0]);
+                leafs = resolveLeafs(typed[0]);
+            }
 
-                if (!leafs.includes('Id')) {
-                    leafs.push('Id');
-                }
+            // tslint:disable-next-line:max-line-length
+            const soql = `SELECT ${leafs.concat(parents).concat(children).join()} FROM ${info.fieldName} ${id !== '' ? `WHERE Id = '${id}'` : ''}`;
+            console.log(soql);
 
-                // tslint:disable-next-line:max-line-length
-                const soql = `SELECT Id, ${leafs.map(l => info.fieldName + '.' + l).join()} FROM ${obj.attributes.type} WHERE Id = '${obj._ParentId}'`;
-                const conn = new Connection(this.options);
-                await conn.login(this.username, this.password);
-                const res = await conn.query(soql);
-                console.log(res);
-                if (res.records && res.records[0] && res.records[0][info.fieldName]) {
-                    res.records = res.records.map(r => ({ ...r, [info.fieldName]: {
-                        ...r[info.fieldName],
-                        _ParentId: r[info.fieldName].Id,
-                    } }));
-                }
+            const conn = new Connection(this.options);
+            await conn.login(this.username, this.password);
+            const res = await conn.query(soql);
+            console.log(res);
+            const final = resolve(res);
+            console.log(final);
 
-                return res.records && res.records[0] && res.records[0][info.fieldName];
-            }) as GraphQLFieldResolver<{ _ParentId: string, attributes: { type: string } }, any, any>;
-        } else if (rel && childRel) {
-            return ( async (obj, args, context, info) => {
-                console.log('obj', obj);
-                console.log('args', args);
-                console.log('info', info);
-                return null;
-            }) as GraphQLFieldResolver<{ _ParentId: string }, any, any>;
+            if (info.returnType instanceof GraphQLList) {
+                return final;
+            }
 
-        } else {
-            return ( async (obj, args, context, info) => {
-                console.log('obj', obj);
-                console.log('args', args);
-                console.log('info', info);
-                const typed = info.fieldNodes
-                                  .map(f => this.getTypeInfoForQuery(this.resolveQuery(f),
-                                                                     info.parentType as GraphQLObjectType));
-                console.log('typed', typed);
-                let soql = '';
-                if (this.isRootParentParent(typed[0])) {
-                    const leafs = typed[0].sub.filter(f => f.leaf).map(f => f.root);
-                    const parentLeafs = typed[0].sub.filter(f => f.relationship && !f.childRelationship).
-                }
-                return null;
-            }) as GraphQLFieldResolver<{ _ParentId: string }, any, any>;
-        }
+            return final && final[0];
+        }) as GraphQLFieldResolver<{ Id: string } & any, any, any>;
     }
 
     private async makeSchema(conn: Connection) {
@@ -241,32 +144,8 @@ export class SFGraphQL {
                                 [o.name]: {
                                     type: new GraphQLList(o),
                                     description: o.description,
-                                    resolve: async (root: any, args: any, context: any, info: GraphQLResolveInfo) => {
-                                        console.log('root', root);
-                                        console.log('args', args);
-                                        console.log('context', context);
-                                        console.log('info', info);
-                                        const typed = info.fieldNodes.map(f =>
-                                                this.getTypeInfoForQuery(this.resolveQuery(f),
-                                                                         info.parentType as GraphQLObjectType))[0];
-                                        console.log('typed', typed);
-
-                                        const leafs = typed.sub.filter(f => f.leaf).map(l => l.root);
-                                        if (!leafs.includes('Id')) {
-                                            leafs.push('Id');
-                                        }
-                                        const hasParent = typed.sub.some(f => f.relationship && !f.childRelationship);
-
-                                        const soql = `SELECT ${leafs.join()} FROM ${info.fieldName}`;
-                                        await conn.login(this.username, this.password);
-                                        const res = await conn.query(soql);
-                                        console.log('res', res);
-                                        if (hasParent && res.records) {
-                                            res.records = res.records.map(r => ({...r, _ParentId: r.Id }));
-                                        }
-                                        return res.records;
-                                    },
-                            }}))
+                                    resolve: this.createResolver(false, false),
+                             }}))
                             .reduce((p, c) => ({...p, ...c}), {});
 
         return new GraphQLSchema({
