@@ -1,18 +1,18 @@
 {
-    "defaultSeverity": "error",
-    "extends": [
-        "tslint:recommended"
-    ],
-    "jsRules": {},
-    "rules": {
-        "quotemark": [true, "single"],
-        "ordered-imports": false,
-        "curly": false,
-        "object-literal-sort-keys": false,
-        "no-consecutive-blank-lines": false,
-        "arrow-parens": false,
-        "interface-name": false,
-        "no-shadowed-variable": false
-    },
-    "rulesDirectory": []
+  "defaultSeverity": "error",
+  "extends": [
+    "tslint:recommended"
+  ],
+  "jsRules": {},
+  "rules": {
+    "quotemark": [true, "single"],
+    "ordered-imports": false,
+    "curly": false,
+    "object-literal-sort-keys": false,
+    "no-consecutive-blank-lines": false,
+    "arrow-parens": false,
+    "interface-name": false,
+    "no-shadowed-variable": false
+  },
+  "rulesDirectory": []
 }

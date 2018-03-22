@@ -76,9 +76,10 @@ export const resolveParentQueries = (q: TypedQuery): string[] => {
 
     let scalars: string[] = [];
     if (query.leaf) {
-      scalars.push(query.root, 'Id');
+      scalars.push(query.root);
     }
     if (query.relationship && !query.childRelationship) {
+      scalars.push(`${query.root}.Id`);
       scalars = scalars.concat(
           flatten<string>(query.sub.map(s => recurse(s, depth + 1)
                                .map(v => query.root + '.' + v))));
@@ -86,19 +87,15 @@ export const resolveParentQueries = (q: TypedQuery): string[] => {
     return scalars;
   };
 
-  return unique(flatten<string>(q.sub.filter(s => !s.leaf)
-                                     .map(s => recurse(s, 0)
-                                                  .map(s => q.root + '.' + s))));
+  const res = flatten<string>(getParentSubqueries(q)
+                                     .map(s => recurse(s, 0)));
+  return unique(res);
 };
 
 export const resolveChildrenQueries = (q: TypedQuery): string[] =>
   getChildSubqueries(q).map(c => {
     const scalars = resolveLeafs(c);
-    const parents = resolveParentQueries(c).map(r => {
-      const idx = r.indexOf(c.root);
-      if (idx < 0) return r;
-      return r.substring(c.root.length + 1);
-    });
+    const parents = resolveParentQueries(c);
     return `(SELECT ${scalars.concat(parents).join()} FROM ${c.root})`;
   });
 
@@ -116,6 +113,33 @@ export const leafsFullyResolved = (obj: any, q: TypedQuery[]) => {
   const leafs = q.filter(f => f.leaf).map(f => f.root);
   const hasAllLeafs = leafs.every(l => !isObject(obj[l]));
   return hasAllLeafs;
+};
+
+export const findUnresolvedLeafs = (obj: any, q: TypedQuery) => {
+  const leafs = resolveLeafs(q);
+  const unresolved: { [idx: number]: string[] } = {};
+  // TODO: Optimize this somehow
+  for (const l of leafs) {
+    if (Array.isArray(obj)) {
+      for (let i = 0; i < obj.length; i++) {
+        if (!(l in obj[i])) {
+          if (typeof unresolved[i] === 'undefined')
+            unresolved[i] = [l];
+          else
+            unresolved[i].push(l);
+        }
+      }
+    } else {
+      if (!(l in obj)) {
+        if (typeof unresolved[0] === 'undefined')
+          unresolved[0] = [l];
+        else
+          unresolved[0].push(l);
+      }
+    }
+  }
+
+  return unresolved;
 };
 
 const isQueryResult = (q: any): q is QueryResult => {
