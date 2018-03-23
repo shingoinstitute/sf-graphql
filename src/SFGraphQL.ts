@@ -5,14 +5,13 @@ import {
   GraphQLID, GraphQLList, GraphQLBoolean, GraphQLInt, GraphQLScalarType,
   GraphQLUnionType, GraphQLObjectType, GraphQLSchema, GraphQLFieldConfig,
   GraphQLResolveInfo, isLeafType, GraphQLType, GraphQLOutputType, FieldNode, getNamedType,
-  isCompositeType, isOutputType, GraphQLFieldResolver
-} from 'graphql';
+  isCompositeType, isOutputType, GraphQLFieldResolver } from 'graphql';
 import { filter, pick, flatten } from 'ramda';
 import { writeFileSync } from 'fs';
 import {
-  resolveParentQueries, resolveLeafs, Query,
-  TypedQuery, getTypedQuery, resolveChildrenQueries, leafsFullyResolved, resolve, findUnresolvedLeafs
-} from './SOQL';
+  resolveParentQueries, resolveLeafs,
+  TypedQuery, getTypedQuery, resolveChildrenQueries, resolve,
+  findUnresolvedLeafs, createSOQL, getConnection, querySOQL, findUnresolvedChildren } from './SOQL';
 import { isNumber } from 'util';
 import { unique } from './util';
 
@@ -96,19 +95,19 @@ export class SFGraphQL {
   private createResolver(childRel: boolean): GraphQLFieldResolver<any, any, any> {
     return (async (obj, args, context, info) => {
       // tslint:disable:no-console
-      console.log('\n\n=====START=====');
-      console.log('obj', obj);
-      console.log('info', info);
 
       const typed = getTypedQuery(info.fieldNodes, info.parentType as GraphQLObjectType);
-      console.log('typed', typed);
       if (typeof obj !== 'undefined' && info.path && typeof info.path.prev !== 'undefined') {
+        console.log('\n\n=====START=====');
+        console.log('obj', obj);
+        console.log('info', info);
+        console.log('typed', typed);
         // this is not a root resolver
         const current = obj[info.path.key];
-        console.log('current', current);
 
         // we didn't get data for our previous query, don't continue
         if (current === null) return current;
+        console.log('current', current);
 
         if (typeof current === 'undefined') {
           console.log('----No Previous----');
@@ -123,74 +122,26 @@ export class SFGraphQL {
             const soql = `SELECT Id, (SELECT ${leafs.concat(parents).join()} FROM ${info.fieldName}) FROM ${parentObj} WHERE Id = '${parentId}'`;
             console.log(soql);
 
-            const conn = new Connection(this.options);
-            await conn.login(this.username, this.password);
+            const conn = getConnection(context, this.username, this.password, this.options);
 
-            return conn.query(soql).then(q => {
-              const final = resolve(q);
-              if (!final) return null;
+            return querySOQL(soql, context).then(q => {
+              if (!q) return null;
 
-              return final[0][info.fieldName];
+              return q[0][info.fieldName];
             });
           } else {
             console.log('Parent Relationship');
+            const leafs = resolveLeafs(typed[0]);
             const parents = resolveParentQueries(typed[0]);
             const children = resolveChildrenQueries(typed[0]);
+            const soql = `SELECT ${leafs.concat(parents).concat(children)}`;
 
           }
 
           return null;
         }
 
-        const unresolvedLeafs = findUnresolvedLeafs(obj[info.path.key], typed[0]);
-
-        if (Array.isArray(current) && Object.keys(unresolvedLeafs).length > 0) {
-          console.log('UNRESOLVED: ', unresolvedLeafs);
-          const promises = [];
-          const conn = new Connection(this.options);
-          await conn.login(this.username, this.password);
-          for (const key in unresolvedLeafs) {
-            if (unresolvedLeafs.hasOwnProperty(key)) {
-
-              if (!unresolvedLeafs[key].includes('Id'))
-                unresolvedLeafs[key].push('Id');
-
-              promises.push(
-                // tslint:disable-next-line:max-line-length
-                conn.query(`SELECT ${unresolvedLeafs[key].join()} FROM ${current[key].attributes.type} WHERE Id = '${current[key].Id}`)
-                  .then(q => {
-
-                    if (q.totalSize > 0) {
-                      const final = resolve(q);
-                      if (!final) return current[key];
-                      return { ...current[key], ...final[0] };
-                    }
-
-                    return current[key];
-                  }),
-              );
-            }
-          }
-
-          return promises;
-        } else if (Object.keys(unresolvedLeafs).length > 0) {
-          const conn = new Connection(this.options);
-          await conn.login(this.username, this.password);
-          // tslint:disable-next-line:max-line-length
-          return conn.query(`SELECT ${unresolvedLeafs[0].join()} FROM ${current.attributes.type} WHERE Id = '${current.Id}`)
-                     .then(q => {
-                       if (q.totalSize > 0) {
-                         const final = resolve(q);
-                         if (!final) return current;
-
-                         return { ...current, ...final[0] };
-                       }
-
-                       return current;
-                     });
-        }
-
-        return obj[info.path.key];
+        return current;
       }
 
       return null;
@@ -214,22 +165,8 @@ export class SFGraphQL {
           type: new GraphQLList(o),
           description: o.description,
           resolve: (async (obj, args, context, info) => {
-
-            const typed = getTypedQuery(info.fieldNodes, info.parentType as GraphQLObjectType);
-            const parents = resolveParentQueries(typed[0]);
-            const children = resolveChildrenQueries(typed[0]);
-            const leafs = resolveLeafs(typed[0]);
-
-            // tslint:disable-next-line:max-line-length
-            const soql = `SELECT ${unique(leafs.concat(parents).concat(children)).join()} FROM ${info.fieldName}`;
-            console.log('\n\nROOT RESOLVER\n\n');
-            console.log(typed[0]);
-            console.log(soql);
-            const conn = new Connection(this.options);
-            await conn.login(this.username, this.password);
-            const res = await conn.query(soql);
-            const final = resolve(res);
-            console.log(final);
+            const connection = getConnection(context, this.username, this.password, this.options);
+            const final = await querySOQL(createSOQL(info), context);
 
             if (info.returnType instanceof GraphQLList) {
               return final;

@@ -1,6 +1,6 @@
 import { flatten } from 'ramda';
-import { getNamedType, isLeafType, isOutputType, GraphQLObjectType, FieldNode } from 'graphql';
-import { QueryResult } from 'jsforce';
+import { getNamedType, isLeafType, isOutputType, GraphQLObjectType, FieldNode, GraphQLResolveInfo } from 'graphql';
+import { QueryResult, Connection, ConnectionOptions } from 'jsforce';
 import { isObject, unique } from './util';
 
 export interface Query {
@@ -91,7 +91,6 @@ export const resolveParentQueries = (q: TypedQuery): string[] => {
                                      .map(s => recurse(s, 0)));
   return unique(res);
 };
-
 export const resolveChildrenQueries = (q: TypedQuery): string[] =>
   getChildSubqueries(q).map(c => {
     const scalars = resolveLeafs(c);
@@ -108,12 +107,6 @@ export const resolveLeafs = (q: TypedQuery): string[] => {
 
   return leafs;
 } ;
-
-export const leafsFullyResolved = (obj: any, q: TypedQuery[]) => {
-  const leafs = q.filter(f => f.leaf).map(f => f.root);
-  const hasAllLeafs = leafs.every(l => !isObject(obj[l]));
-  return hasAllLeafs;
-};
 
 export const findUnresolvedLeafs = (obj: any, q: TypedQuery) => {
   const leafs = resolveLeafs(q);
@@ -135,6 +128,43 @@ export const findUnresolvedLeafs = (obj: any, q: TypedQuery) => {
           unresolved[0] = [l];
         else
           unresolved[0].push(l);
+      }
+    }
+  }
+
+  return unresolved;
+};
+export interface UnresolvedLeafs { [idx: number]: string[]; }
+export interface UnresolvedChildren { [idx: number]: { [child: string]: string[] }; }
+
+export const findUnresolvedChildren = (obj: any, q: TypedQuery): UnresolvedChildren => {
+  // TODO: Optimize this
+  const children = getChildSubqueries(q);
+
+  const unresolved: { [idx: number]: { [child: string]: string[] }} = {};
+  const addUnresolved = (idx: number, add: { [child: string]: string[] }) => {
+    if (typeof unresolved[idx] === 'undefined')
+      unresolved[idx] = { ...add };
+    else
+      unresolved[idx] = { ...add, ...unresolved[idx] };
+  };
+
+  for (const c of children) {
+    if (Array.isArray(obj)) {
+      for (let i = 0; i < obj.length; i++) {
+        if (Array.isArray(obj[i][c.root])) return {};
+
+        const unresolvedLeafs = findUnresolvedLeafs(obj[i][c.root] || {}, c);
+        if (Object.keys(unresolvedLeafs).length > 0) {
+          addUnresolved(i, { [c.root]: unresolvedLeafs[0] });
+        }
+      }
+    } else {
+      if (Array.isArray(obj[c.root])) return {};
+
+      const unresolvedLeafs = findUnresolvedLeafs(obj[c.root] || {}, c);
+      if (Object.keys(unresolvedLeafs).length > 0) {
+        addUnresolved(0, { [c.root]: unresolvedLeafs[0] });
       }
     }
   }
@@ -166,4 +196,49 @@ export const resolve = (q: QueryResult) => {
 
     return newRecord;
   });
+};
+
+export const createSOQL = (info: GraphQLResolveInfo): string => {
+    const typed = getTypedQuery(info.fieldNodes, info.parentType as GraphQLObjectType);
+    const parents = resolveParentQueries(typed[0]);
+    const children = resolveChildrenQueries(typed[0]);
+    const leafs = resolveLeafs(typed[0]);
+
+    const soql = `SELECT ${unique(leafs.concat(parents).concat(children)).join()} FROM ${info.fieldName}`;
+    return soql;
+};
+
+export const getConnection = (context: any,
+                              username: string,
+                              password: string,
+                              options: Partial<ConnectionOptions>): Connection => {
+  if (!context.sf_username) {
+    context.sf_username = username;
+  }
+
+  if (!context.sf_password) {
+    context.sf_password = password;
+  }
+
+  if (context.sf_connection) {
+    return context.sf_connection;
+  } else {
+    context.sf_connection = new Connection(options);
+    return context.sf_connection;
+  }
+};
+
+export const querySOQL = async (soql: string,
+                                context: { sf_connection: Connection, sf_password: string, sf_username: string}) => {
+    let res = null;
+    console.log(soql);
+
+    try {
+      res = await context.sf_connection.query(soql);
+    } catch {
+      await context.sf_connection.login(context.sf_username, context.sf_password);
+      res = await context.sf_connection.query(soql);
+    }
+
+    return resolve(res);
 };
